@@ -24,14 +24,14 @@ Critical Fields
 ---------------
 question                 : Raw user query (immutable anchor)
 query_rewritten          : Normalized / rephrased version after query processing
-route                    : Routing decision (SIMPLE / SLOW / FAST)
+route                    : Routing decision (FAST or SLOW)
 task_type               : The type of task being performed
 retrieval_queries        : The actual query/queries used for retrieval
 retrieved_docs           : Raw retrieved evidence (before reranking)
 reranked_docs            : Post-reranking evidence
 evidence_snippets        : The specific text spans used as evidence
 evidence_score           : Sufficiency score from verification
-fallback_triggered       : Whether the slow/fast path fell back to MCP tools
+fallback_triggered       : Whether the slow path fell back to MCP tools
 candidate_tools          : Tool options considered for this step
 tool_call_results       : Actual tool execution results
 answer_draft            : Pre-verification answer draft
@@ -59,11 +59,14 @@ import operator
 # ---------------------------------------------------------------------------
 
 class Route(str, Enum):
-    """Routing decisions from the SemanticRouter node."""
+    """Routing decisions from the SemanticRouter node.
 
-    SIMPLE = "simple"        # Single-hop, bypass retrieval
-    COMPLEX_SLOW = "slow"    # Multi-hop, full retrieval, no planning loop
-    COMPLEX_FAST = "fast"    # Complex, task decomposition + evidence verification loop
+    FAST  — Simple, single-hop, light retrieval
+    SLOW  — Complex, multi-hop, full retrieval pipeline
+    """
+
+    FAST = "fast"   # Simple, single-hop, light retrieval
+    SLOW = "slow"  # Complex, multi-hop, full retrieval pipeline
 
 
 class RetrievalStrategy(str, Enum):
