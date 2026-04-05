@@ -45,6 +45,7 @@ from .state import (
     ToolCandidate,
     Citation,
 )
+from models.qwen_llm import QwenGeneratorFast, QwenGeneratorSlow
 from memory.context_manager import TruncationNode, TokenBudgetManager, TruncationPolicy, SemanticTruncator,
 )
 
@@ -397,15 +398,18 @@ class RetrievalPlanningNode:
 class SlowRetrievalNode:
     """
     Hybrid retrieval for the slow complex path (single query, no decomposition).
+
+    Uses route="slow" so that retriever uses rerank_top_k_out_slow=8 final chunks.
     """
 
-    def __init__(self, retriever: Any) -> None:
+    def __init__(self, retriever: Any, route: str = "slow") -> None:
         self.retriever = retriever
+        self.route = route  # "slow" → final_k=8 per RerankerConfig
 
     def run(self, state: GraphState) -> GraphState:
         question = state["question"]
         try:
-            chunks = self.retriever.retrieve(query=question, mode="hybrid")
+            chunks = self.retriever.retrieve(query=question, mode="hybrid", route=self.route)
             docs = [
                 RetrievedDoc(
                     chunk_id=c.chunk_id,
@@ -430,10 +434,14 @@ class SlowRetrievalNode:
 # ---------------------------------------------------------------------------
 
 class SlowRerankNode:
-    """Re-ranks slow-path documents using BGE-Reranker."""
+    """Re-ranks slow-path documents using BGE-Reranker.
 
-    def __init__(self, reranker: Any) -> None:
+    Slow path uses rerank_top_k_out_slow=8 per RerankerConfig.
+    """
+
+    def __init__(self, reranker: Any, route: str = "slow") -> None:
         self.reranker = reranker
+        self.route = route
 
     def run(self, state: GraphState) -> GraphState:
         docs = state.get("slow_retrieved_docs", [])
@@ -465,11 +473,12 @@ class SlowRerankNode:
 class FastRetrievalNode:
     """
     Multi-query retrieval for the fast complex path.
-    Uses retrieve_multi_query to handle decomposed sub-tasks in parallel.
+    Uses route="fast" so that retriever uses rerank_top_k_out_fast=6 final chunks.
     """
 
-    def __init__(self, retriever: Any) -> None:
+    def __init__(self, retriever: Any, route: str = "fast") -> None:
         self.retriever = retriever
+        self.route = route  # "fast" → final_k=6 per RerankerConfig
 
     def run(self, state: GraphState) -> GraphState:
         queries = state.get("retrieval_queries", [])
@@ -479,7 +488,9 @@ class FastRetrievalNode:
             queries = [state["question"]]
 
         try:
-            chunks = self.retriever.retrieve_multi_query(queries=queries, mode="hybrid")
+            chunks = self.retriever.retrieve_multi_query(
+                queries=queries, mode="hybrid", route=self.route
+            )
             docs: list[RetrievedDoc] = [
                 RetrievedDoc(
                     chunk_id=c.chunk_id,
@@ -505,10 +516,14 @@ class FastRetrievalNode:
 # ---------------------------------------------------------------------------
 
 class FastRerankNode:
-    """Re-ranks fast-path documents using BGE-Reranker."""
+    """Re-ranks fast-path documents using BGE-Reranker.
 
-    def __init__(self, reranker: Any) -> None:
+    Fast path uses rerank_top_k_out_fast=6 per RerankerConfig.
+    """
+
+    def __init__(self, reranker: Any, route: str = "fast") -> None:
         self.reranker = reranker
+        self.route = route
 
     def run(self, state: GraphState) -> GraphState:
         docs = state.get("fast_retrieved_docs", [])
@@ -723,22 +738,33 @@ class GenerationNode:
     """
     Shared answer generation node for both slow and fast complex paths.
 
-    Reads from slow_reranked_docs (slow path) or fast_reranked_docs (fast path).
-    Sets answer_draft in state (not answer_final — that's set after verification).
+    Uses the correct generator based on route:
+    - Route.COMPLEX_SLOW → QwenGeneratorSlow (enable_thinking=True, max_tokens=1024)
+    - Route.COMPLEX_FAST → QwenGeneratorFast (enable_thinking=False, max_tokens=512)
+
+    Reads from slow_reranked_docs (slow) or fast_reranked_docs (fast).
+    Sets answer_draft in state (answer_final is set after VerificationNode).
     """
 
-    def __init__(self, generator: Any) -> None:
-        self.generator = generator
+    def __init__(
+        self,
+        generator_fast: Any,
+        generator_slow: Any,
+    ) -> None:
+        self._gen_fast = generator_fast
+        self._gen_slow = generator_slow
 
     def run(self, state: GraphState) -> GraphState:
         question = state["question"]
         route = state.get("route", Route.COMPLEX_SLOW)
 
-        # Select docs based on path
+        # Select docs and generator based on route
         if route == Route.COMPLEX_SLOW:
             docs = state.get("slow_reranked_docs", [])
+            generator = self._gen_slow
         else:
             docs = state.get("fast_reranked_docs", [])
+            generator = self._gen_fast
 
         evidence_chunks = [
             {
@@ -750,13 +776,12 @@ class GenerationNode:
         ]
 
         try:
-            response = self.generator.generate_answer(
+            response = generator.generate_answer(
                 query=question,
                 evidence_chunks=evidence_chunks,
             )
             state["answer_draft"] = response.content
 
-            # Build citation list from evidence chunks
             citations = [
                 Citation(
                     source_doc=d.source_doc,
@@ -873,19 +898,14 @@ class FinancialRAGWorkflow:
         session_id: Optional[str] = None,
     ) -> None:
         self.router = router
-        self.generator = generator
         self.retriever = retriever
         self.reranker = reranker
         self.judge_model = judge_model or router
         self.verification_tools = verification_tools or {}
-        self.memory_manager = memory_manager
         self.mcp_tool_registry = mcp_tool_registry or {}
         self.session_id = session_id or str(uuid.uuid4())
 
         # ── Token Budget Manager (shared global across all nodes) ────────────
-        # The budget_manager is a shared singleton. All nodes access the SAME
-        # instance via this reference, which lives on the workflow object.
-        # TruncationNode reads/writes the same dict in GraphState.
         self.budget_manager = budget_manager or TokenBudgetManager(
             policy=TruncationPolicy(
                 budget=8192,
@@ -894,20 +914,26 @@ class FinancialRAGWorkflow:
             )
         )
 
+        # ── Generators — fast and slow use DIFFERENT parameter sets ────────────
+        # Fast path (simple): Qwen3-8B, enable_thinking=False, temperature=0.1
+        self._gen_fast = QwenGeneratorFast(config=None)  # Uses config defaults
+        # Slow path (complex): Qwen3-8B, enable_thinking=True, temperature=0.3
+        self._gen_slow = QwenGeneratorSlow(config=None)  # Uses config defaults
+
         # ── Initialize all nodes ─────────────────────────────────────────
         self._input = InputNode(session_id=self.session_id)
         self._truncation = TruncationNode(self.budget_manager)
         self._semantic_router = SemanticRouterNode(router)
-        self._direct_gen = DirectGenerationNode(generator, self.budget_manager)
-        self._task_decomp = TaskDecompositionNode(generator)
+        self._direct_gen = DirectGenerationNode(self._gen_fast, self.budget_manager)
+        self._task_decomp = TaskDecompositionNode(self._gen_slow)
         self._retrieval_plan = RetrievalPlanningNode()
-        self._slow_retrieval = SlowRetrievalNode(retriever)
-        self._slow_rerank = SlowRerankNode(reranker)
-        self._fast_retrieval = FastRetrievalNode(retriever)
-        self._fast_rerank = FastRerankNode(reranker)
+        self._slow_retrieval = SlowRetrievalNode(retriever, route="slow")
+        self._slow_rerank = SlowRerankNode(reranker, route="slow")
+        self._fast_retrieval = FastRetrievalNode(retriever, route="fast")
+        self._fast_rerank = FastRerankNode(reranker, route="fast")
         self._evidence_check = EvidenceSufficiencyNode(self.judge_model)
         self._mcp_tool = MCPToolNode(self.mcp_tool_registry)
-        self._generation = GenerationNode(generator)
+        self._generation = GenerationNode(self._gen_fast, self._gen_slow)
         self._verification = VerificationNode(self.verification_tools)
 
         self.graph = self._build_graph()

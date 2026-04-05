@@ -339,53 +339,87 @@ class HybridRetriever:
     Hybrid retrieval pipeline combining BGE-M3 (dense), BM25 (sparse),
     RRRF fusion, and BGE-Reranker for precision re-ranking.
 
-    Parameters
-    ----------
-    dense_model : str, default "BAAI/bge-m3"
-        HuggingFace model name for BGE-M3 dense embeddings.
-    sparse_model : {"bm25"}, default "bm25"
-        Sparse retrieval backend.
-    reranker_model : str, default "BAAI/bge-reranker-v2-m3"
-        HuggingFace model name for the cross-encoder reranker.
-    device : str, optional
-        "cuda" or "cpu". Auto-detected if omitted.
-    top_k : int, default 20
-        Number of documents to retrieve per branch (dense + sparse)
-        before fusion and reranking.
-    final_k : int, default 5
-        Number of documents to return after fusion and reranking.
-    rrrf_k : float, default 60.0
-        RRRF damping parameter.
-    collection : Optional[list[dict]], default None
-        Pre-loaded document collection. Each dict must have keys:
-        "chunk_id", "text", "source_doc", "page_number", "token_count".
+    All retrieval parameters are driven by config.py (RetrievalConfig + RerankerConfig).
+    No hardcoded top_k or RRF parameters in this file.
 
-    Examples
-    --------
-    >>> retriever = HybridRetriever()
-    >>> retriever.load_collection([
-    ...     {"chunk_id": "c1", "text": "Apple revenue grew 7%", "source_doc": "a.pdf", "page_number": 5, "token_count": 20},
-    ... ])
-    >>> chunks = retriever.retrieve("Apple revenue FY2024")
+    RetrievalConfig:
+        top_k_dense = 15     (retrieve top-15 from dense branch)
+        top_k_bm25  = 15     (retrieve top-15 from BM25 branch)
+        rrf_k       = 60.0   (RRF damping parameter)
+
+    RerankerConfig:
+        rerank_top_k_in      = 20  (rerank 20 fused candidates)
+        rerank_top_k_out_fast = 6  (final chunks for fast path)
+        rerank_top_k_out_slow = 8  (final chunks for slow path)
+        score_threshold       = 0.15
+
+    Usage
+    -----
+        >>> from config import get_config
+        >>> cfg = get_config()
+        >>> retriever = HybridRetriever(config=cfg)
+        >>> # Fast path (simple question): final_k=6
+        >>> chunks = retriever.retrieve("Apple revenue FY2024", route="fast")
+        >>> # Slow path (complex analysis): final_k=8
+        >>> chunks = retriever.retrieve("Compare revenue trends...", route="slow")
     """
 
     def __init__(
         self,
-        dense_model: str = "BAAI/bge-m3",
+        config: Optional[Any] = None,
+        dense_model: Optional[str] = None,
         sparse_model: Literal["bm25"] = "bm25",
-        reranker_model: str = "BAAI/bge-reranker-v2-m3",
         device: Optional[str] = None,
-        top_k: int = 20,
-        final_k: int = 5,
-        rrrf_k: float = 60.0,
         collection: Optional[list[dict]] = None,
     ) -> None:
-        self.top_k = top_k
-        self.final_k = final_k
-        self.rrrf_k = rrrf_k
+        # Load parameters from config
+        if config is not None:
+            retrieval_cfg = getattr(config, "retrieval", None)
+            reranker_cfg = getattr(config, "reranker", None)
+        else:
+            retrieval_cfg = None
+            reranker_cfg = None
+
+        self._retrieval_cfg = retrieval_cfg
+        self._reranker_cfg = reranker_cfg
+
+        # Dense branch
+        self.top_k_dense = (
+            getattr(retrieval_cfg, "top_k_dense", 15)
+            if retrieval_cfg else 15
+        )
+        self.top_k_bm25 = (
+            getattr(retrieval_cfg, "top_k_bm25", 15)
+            if retrieval_cfg else 15
+        )
+        self.rrrf_k = (
+            getattr(retrieval_cfg, "rrf_k", 60.0)
+            if retrieval_cfg else 60.0
+        )
+
+        # Reranker
+        self.rerank_top_k_in = (
+            getattr(reranker_cfg, "rerank_top_k_in", 20)
+            if reranker_cfg else 20
+        )
+        self.score_threshold = (
+            getattr(reranker_cfg, "score_threshold", 0.15)
+            if reranker_cfg else 0.15
+        )
+
+        # Model names
+        embedding_model = (
+            getattr(config.embedding, "model", "BAAI/bge-m3")
+            if config is not None and hasattr(config, "embedding")
+            else (dense_model or "BAAI/bge-m3")
+        )
+        reranker_model = (
+            getattr(reranker_cfg, "model", "BAAI/bge-reranker-v2-m3")
+            if reranker_cfg else "BAAI/bge-reranker-v2-m3"
+        )
 
         self.dense_retriever = BGEEmbeddingRetriever(
-            model_name_or_path=dense_model,
+            model_name_or_path=embedding_model,
             device=device,
         )
         self.sparse_retriever = BM25SparseRetriever()
@@ -420,6 +454,7 @@ class HybridRetriever:
         self,
         query: str,
         mode: RetrievalMode = "rerank",
+        route: str = "fast",
     ) -> list[RetrievedChunk]:
         """
         Retrieve and rank document chunks for a query.
@@ -434,6 +469,10 @@ class HybridRetriever:
               - "sparse_only"   : BM25 sparse retrieval only
               - "hybrid"        : RRRF fusion of dense + sparse (no rerank)
               - "rerank"        : hybrid → BGE-Reranker (default, recommended)
+        route : str, default "fast"
+            Route type, controls final output count:
+              - "fast" : final_k = rerank_top_k_out_fast (default 6)
+              - "slow" : final_k = rerank_top_k_out_slow (default 8)
 
         Returns
         -------
@@ -444,11 +483,24 @@ class HybridRetriever:
                 "No collection loaded. Call load_collection() first."
             )
 
+        # Determine final_k based on route
+        reranker_cfg = self._reranker_cfg
+        if route == "slow":
+            final_k = (
+                getattr(reranker_cfg, "rerank_top_k_out_slow", 8)
+                if reranker_cfg else 8
+            )
+        else:
+            final_k = (
+                getattr(reranker_cfg, "rerank_top_k_out_fast", 6)
+                if reranker_cfg else 6
+            )
+
         texts = [doc["text"] for doc in self._collection]
 
         # Stage 1 & 2 — parallel dense + sparse retrieval
-        dense_results = self.dense_retriever.retrieve(query, texts, top_k=self.top_k)
-        sparse_results = self.sparse_retriever.retrieve(query, top_k=self.top_k)
+        dense_results = self.dense_retriever.retrieve(query, texts, top_k=self.top_k_dense)
+        sparse_results = self.sparse_retriever.retrieve(query, top_k=self.top_k_bm25)
 
         # Build ranked lists for RRRF
         if mode == "dense_only":
@@ -456,7 +508,6 @@ class HybridRetriever:
         elif mode == "sparse_only":
             fused = [(idx, score) for idx, score in sparse_results]
         else:
-            # Pad shorter list to match lengths for RRRF
             dense_ranked = [(str(idx), score) for idx, score in dense_results]
             sparse_ranked = [(str(idx), score) for idx, score in sparse_results]
             fused = reciprocal_rank_fusion(
@@ -464,7 +515,7 @@ class HybridRetriever:
             )
 
         # Extract texts for reranking (or return directly if no rerank)
-        fused_indices = [int(doc_id) for doc_id, _ in fused[: self.final_k]]
+        fused_indices = [int(doc_id) for doc_id, _ in fused[:self.rerank_top_k_in]]
         fused_texts = [texts[i] for i in fused_indices]
         fused_scores = {int(doc_id): score for doc_id, score in fused}
 
@@ -472,10 +523,15 @@ class HybridRetriever:
             reranked = self.reranker.rerank(
                 query, fused_texts, top_k=len(fused_texts)
             )
-            final_indices = [fused_indices[i] for i, _ in reranked]
-            final_scores = reranked
+            # Filter by score threshold
+            filtered_reranked = [
+                (idx, score) for idx, score in reranked
+                if score >= self.score_threshold
+            ]
+            final_indices = [fused_indices[i] for i, _ in filtered_reranked[:final_k]]
+            final_scores = filtered_reranked[:final_k]
         else:
-            final_indices = fused_indices
+            final_indices = fused_indices[:final_k]
             final_scores = [(i, fused_scores[i]) for i in final_indices]
 
         # Build RetrievedChunk objects
@@ -504,16 +560,20 @@ class HybridRetriever:
         return chunks
 
     def retrieve_multi_query(
-        self, queries: list[str], mode: RetrievalMode = "rerank"
+        self,
+        queries: list[str],
+        mode: RetrievalMode = "rerank",
+        route: str = "fast",
     ) -> list[RetrievedChunk]:
         """
-        Retrieve documents for multiple queries (e.g. sub-tasks from a
-        decomposed complex question) and merge results via RRRF.
+        Retrieve documents for multiple queries and merge via RRRF.
 
         Parameters
         ----------
         queries : list of str
         mode : RetrievalMode
+        route : str, default "fast"
+            "fast" (final_k=6) or "slow" (final_k=8)
 
         Returns
         -------
@@ -521,7 +581,7 @@ class HybridRetriever:
         """
         all_results: list[list[tuple[int, float]]] = []
         for q in queries:
-            chunks = self.retrieve(q, mode=mode)
+            chunks = self.retrieve(q, mode=mode, route=route)
             all_results.append(
                 [(int(c.chunk_id.split("_")[-1]), c.score) for c in chunks]
             )
