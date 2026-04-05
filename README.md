@@ -63,28 +63,44 @@ User Query
 
 ```
 financial-multimodal-rag/
-├── data_pipeline/                 # Data ingestion & document parsing
+├── config.py                      # ⭐ Central parameter configuration (single source of truth)
+├── run.py                         # ⭐ Main entry point — run queries against a collection
+├── ingest.py                      # ⭐ PDF ingestion pipeline — process PDFs into chunks
+├── data_pipeline/                 # DeepDoc document understanding pipeline
 │   ├── __init__.py
-│   └── deepdoc_interface.py      # RAGFlow DeepDoc layout API placeholder
+│   ├── layout_analyzer.py         # YoLo v8 page layout detection
+│   ├── text_extractor.py          # Hierarchical Markdown text extraction
+│   ├── table_structure_recovery.py # CNN-based table structure recognition (TSR)
+│   ├── chart_extractor.py         # Chart semantic description extraction
+│   ├── text_chunker.py            # Markdown-aware text chunking
+│   ├── table_chunker.py           # Table-as-unit chunking
+│   ├── chart_chunker.py           # Chart semantic description chunking
+│   └── deepdoc_interface.py      # Integrated DeepDocPipeline
 ├── retrieval/                     # Hybrid retrieval engine
 │   ├── __init__.py
-│   └── hybrid_retriever.py        # BGE-M3 + BM25 + BGE-Reranker
+│   └── hybrid_retriever.py        # BGE-M3 + BM25 + RRRF + BGE-Reranker
 ├── graph/                          # LangGraph workflow orchestration
 │   ├── __init__.py
-│   └── workflow.py                # State machine with conditional routing
+│   ├── state.py                   # ⭐ GraphState — global shared state schema
+│   └── workflow.py                # ⭐ Complete 3-path state machine
 ├── models/                         # LLM interface wrappers
 │   ├── __init__.py
-│   └── qwen_llm.py                # Qwen3-8B / Qwen3-0.6B / Qwen2.5 API
-├── memory/                         # Context window management
+│   └── qwen_llm.py               # QwenRouter / QwenGeneratorFast / QwenGeneratorSlow / QwenSummarizer
+├── memory/                         # Token budget & context management
 │   ├── __init__.py
-│   └── context_manager.py         # Sliding window + semantic truncation
-├── mcp_tools/                      # MCP protocol toolchain
+│   └── context_manager.py        # ⭐ TokenBudgetManager + SemanticTruncator + TruncationNode
+├── mcp_tools/                      # MCP protocol toolchain (4 categories)
 │   ├── __init__.py
-│   ├── deepdoc_tool.py            # DeepDoc layout analysis tool
-│   └── financial_calc_tool.py     # Financial formula calculator
+│   ├── base.py                   # MCPTool abstract base class
+│   ├── deepdoc_tools.py          # Category 1: DeepDoc parsing
+│   ├── retrieval_tools.py        # Category 2: Retrieval augmentation
+│   ├── analysis_tools.py          # Category 3: Financial analysis
+│   ├── verification_tools.py      # Category 4: Result verification
+│   ├── mcp_server.py            # ⭐ Python MCP Server (stdio, auto-discovers tools)
+│   └── mcp_client.py             # ⭐ MCP Client (LangGraph integration)
 ├── evaluation/                     # Evaluation framework
 │   ├── __init__.py
-│   └── ragas_eval.py              # RAGAS Faithfulness metric
+│   └── ragas_eval.py             # RAGAS Faithfulness evaluation
 ├── requirements.txt
 └── README.md
 ```
@@ -135,29 +151,90 @@ pip install -r requirements.txt
 ### 2. Configure API Keys
 
 ```bash
-# Set your Qwen/DashScope API key
 export DASHSCOPE_API_KEY="your-dashscope-api-key"
-
-# Optional: DeepDoc API (RAGFlow backend)
-export DEEPDOC_API_KEY="your-deepdoc-api-key"
+export DEEPDOC_API_KEY="your-deepdoc-api-key"   # optional
 ```
 
-### 3. Run the RAG Pipeline
+### 3. Ingest PDF Documents
+
+```bash
+# Ingest a single PDF (mock mode — no DeepDoc deps needed for demo)
+python ingest.py --pdf /path/to/annual_report.pdf \
+                 --collection financial_reports \
+                 --embed
+
+# Ingest multiple PDFs from a directory
+python ingest.py --pdf-dir ./data/pdfs/ \
+                 --collection financial_reports \
+                 --embed
+
+# Dry run — see chunks without saving
+python ingest.py --pdf /path/to/report.pdf --show-chunks
+```
+
+**Note:** Without DeepDoc dependencies installed, `ingest.py` runs in **mock mode** and generates placeholder chunks. For real PDF processing, install:
+```bash
+pip install ultralytics paddleocr pdf2image torch
+```
+
+### 4. Run the RAG Pipeline
+
+```bash
+# Single question
+python run.py "What was Apple's total revenue in FY2024?" \
+    --collection financial_reports
+
+# Interactive REPL
+python run.py --interactive --collection financial_reports
+
+# With retrieval details shown
+python run.py "Compare Apple vs Microsoft revenue" \
+    --collection financial_reports \
+    --show-retrieval
+```
+
+**Programmatic usage:**
+```python
+from run import run_query
+result = run_query(
+    question="What was Apple's revenue growth in FY2024?",
+    collection_name="financial_reports",
+)
+print(result["answer_final"])
+print(result["route"])          # 'simple', 'slow', or 'fast'
+print(result["citations"])      # [{source_doc, page_number, text}, ...]
+```
+
+### 5. Programmatic API
 
 ```python
+from config import get_config
+from models.qwen_llm import QwenRouter, QwenGeneratorFast, QwenGeneratorSlow
+from retrieval.hybrid_retriever import HybridRetriever
 from graph.workflow import FinancialRAGWorkflow
-from models.qwen_llm import QwenRouter, QwenGenerator
+from memory.context_manager import TokenBudgetManager
 
-router = QwenRouter()          # Qwen3-0.6B for routing
-generator = QwenGenerator()    # Qwen3-8B for answer generation
+# Initialize from config
+cfg = get_config()
+
+router = QwenRouter(config=cfg.router)
+gen_fast = QwenGeneratorFast(config=cfg.generator_fast)
+gen_slow = QwenGeneratorSlow(config=cfg.generator_slow)
+retriever = HybridRetriever(config=cfg)
+budget_manager = TokenBudgetManager()
 
 workflow = FinancialRAGWorkflow(
     router=router,
-    generator=generator,
-    retriever=retriever,        # hybrid_retriever instance
+    retriever=retriever,
+    reranker=retriever.reranker,
+    budget_manager=budget_manager,
 )
-answer = workflow.run("What was Apple's total revenue in FY2024?")
-print(answer)
+
+# Run a query
+result = workflow.run("What is Apple's ROE trend over 3 years?")
+print(result["answer_final"])
+print(result["route"])          # which path was taken
+print(result["citations"])       # cited sources
 ```
 
 ---
