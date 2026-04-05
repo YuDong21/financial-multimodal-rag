@@ -63,9 +63,9 @@ generation_fast                    slow_retrieval
 ```
 financial-multimodal-rag/
 ├── config.py                      # ⭐ Central parameter configuration (single source of truth)
-├── run.py                         # ⭐ Main entry point — run queries against a collection
-├── ingest.py                      # ⭐ PDF ingestion pipeline — process PDFs into chunks
-├── data_pipeline/                 # DeepDoc document understanding pipeline
+├── run.py                         # ⭐ Interactive Q&A — single query or REPL mode
+├── data_ingest.py                 # ⭐ Offline PDF ingestion —调度 data_pipeline/ 处理 PDF
+├── data_pipeline/                 # DeepDoc document understanding pipeline (chunking 算法)
 │   ├── __init__.py
 │   ├── layout_analyzer.py         # YoLo v8 page layout detection
 │   ├── text_extractor.py          # Hierarchical Markdown text extraction
@@ -157,24 +157,26 @@ export DEEPDOC_API_KEY="your-deepdoc-api-key"   # optional
 ### 3. Ingest PDF Documents
 
 ```bash
-# Ingest a single PDF (mock mode — no DeepDoc deps needed for demo)
-python ingest.py --pdf /path/to/annual_report.pdf \
-                 --collection financial_reports \
-                 --embed
+# 离线处理：调用 data_pipeline/ 处理 PDF，生成 collection
+python data_ingest.py --pdf /path/to/annual_report.pdf \
+                      --collection financial_reports
 
-# Ingest multiple PDFs from a directory
-python ingest.py --pdf-dir ./data/pdfs/ \
-                 --collection financial_reports \
-                 --embed
+# 多文件 + 生成 embedding
+python data_ingest.py --pdf-dir ./data/raw/ \
+                      --collection financial_reports \
+                      --batch-size 32
 
-# Dry run — see chunks without saving
-python ingest.py --pdf /path/to/report.pdf --show-chunks
+# 查看 chunks（不保存）
+python data_ingest.py --pdf /path/to/report.pdf --show
 ```
 
-**Note:** Without DeepDoc dependencies installed, `ingest.py` runs in **mock mode** and generates placeholder chunks. For real PDF processing, install:
-```bash
-pip install ultralytics paddleocr pdf2image torch
-```
+> **chunking 算法全部在 `data_pipeline/` 内，不在本文件。**
+> 本文件仅负责调度：`DeepDocPipeline` → `TextChunker` → `TableChunker` → `ChartChunker` → `BGE-M3 embed` → JSONL
+>
+> 无 DeepDoc 依赖时自动降级为 mock 模式。完整功能需安装：
+> ```bash
+> pip install ultralytics paddleocr pdf2image torch FlagEmbedding
+> ```
 
 ### 4. Run the RAG Pipeline
 
@@ -200,7 +202,7 @@ result = run_query(
     collection_name="financial_reports",
 )
 print(result["answer_final"])
-print(result["route"])          # 'simple', 'slow', or 'fast'
+print(result["route"])          # 'fast' or 'slow'
 print(result["citations"])      # [{source_doc, page_number, text}, ...]
 ```
 
