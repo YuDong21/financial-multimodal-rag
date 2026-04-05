@@ -1,38 +1,49 @@
 """
 LangGraph GraphState — Comprehensive shared state for the financial multimodal RAG workflow.
 
-The GraphState carries all intermediate and persistent data across every node
-in the graph. It is the single source of truth for the entire execution context.
+IMPORTANT — Global Parameter Design
+-----------------------------------
+The GraphState dict is the SINGLE source of truth for the ENTIRE graph execution.
 
-Why GraphState?
----------------
-LangGraph is a stateful, branching graph — not a simple linear chain. Without a
-unified state object, every node would need to pass parameters explicitly, leading
-to: (a) parameter explosion as the number of nodes grows, and (b) state
-inconsistency between nodes that maintain their own partial state.
+It is passed by REFERENCE (not copied) to every node in the graph. In Python terms,
+when LangGraph invokes a node, it passes the SAME dict object — mutations in one node
+are immediately visible to all downstream nodes without any copying or marshalling.
 
-GraphState solves this by providing a shared, mutable context that every node
-reads from and writes to. Nodes are pure functions: state_in → state_out.
+This means:
+  - A write in TruncationNode (e.g., state["memory_summary"] = ...) is visible
+    to SemanticRouterNode, GenerationNode, and every other node in the same invocation.
+  - The token counter state["total_tokens_in_context"] accumulates correctly across
+    all nodes, not just within one node's scope.
+  - Fields like short_term_context, memory_summary, and total_tokens_in_context
+    persist and grow naturally as the graph executes.
+
+Nodes are pure functions: they read from state, compute, write to state, return.
+There is no separate "global variable" — the state dict IS the global context.
 
 Critical Fields
 ---------------
-question           : Raw user query (immutable anchor)
-query_rewritten    : Normalized / rephrased version after query processing
-route              : Routing decision (SIMPLE / SLOW / FAST)
-task_type          : The type of task being performed
-retrieval_queries  : The actual query/queries used for retrieval
-retrieved_docs     : Raw retrieved evidence (before reranking)
-reranked_docs      : Post-reranking evidence
-evidence_snippets  : The specific text spans used as evidence
-evidence_score     : Sufficiency score from verification
-fallback_triggered : Whether the slow/fast path fell back to MCP tools
-candidate_tools   : Tool options considered for this step
-tool_call_results  : Actual tool execution results
-answer_draft       : Pre-verification answer draft
-answer_final       : Verified, citation-aware final answer
-citations          : All citation metadata for the final answer
-short_term_context : Recent conversation turns (rolling window)
-memory_summary     : Compressed summary of older conversation history
+question                 : Raw user query (immutable anchor)
+query_rewritten          : Normalized / rephrased version after query processing
+route                    : Routing decision (SIMPLE / SLOW / FAST)
+task_type               : The type of task being performed
+retrieval_queries        : The actual query/queries used for retrieval
+retrieved_docs           : Raw retrieved evidence (before reranking)
+reranked_docs            : Post-reranking evidence
+evidence_snippets        : The specific text spans used as evidence
+evidence_score           : Sufficiency score from verification
+fallback_triggered       : Whether the slow/fast path fell back to MCP tools
+candidate_tools          : Tool options considered for this step
+tool_call_results       : Actual tool execution results
+answer_draft            : Pre-verification answer draft
+answer_final            : Verified, citation-aware final answer
+citations               : All citation metadata for the final answer
+
+TOKEN BUDGET FIELDS (managed by TruncationNode before router):
+short_term_context       : Recent conversation turns (rolling window, full text)
+total_tokens_in_context  : Live token counter — sum of all short_term_context tokens
+memory_summary           : Semantic summary of OLDER turns (compressed by Qwen2.5-1.5B)
+truncation_applied       : bool — True if truncation was triggered this turn
+budget_threshold         : The token budget limit (set at session init)
 """
 
 from __future__ import annotations
@@ -257,7 +268,10 @@ class GraphState(dict):
     error_message: Optional[str]
     node_errors: dict[str, str]             # Per-node error tracking
 
-    # ─── Memory ────────────────────────────────────────────────────────────
-    short_term_context: list[ConversationTurn]  # Recent turns (rolling window)
-    memory_summary: Optional[str]               # Compressed summary of older history
-    total_tokens_used: int                     # Running token count for budget management
+    # ─── Token Budget & Memory ──────────────────────────────────────────────
+    short_term_context: list[dict]  # Recent turns: [{"role": str, "content": str}]
+    memory_summary: Optional[str]  # Qwen2.5-1.5B compressed summary of older turns
+    total_tokens_in_context: int  # Live token counter (updated by TruncationNode)
+    truncation_applied: bool  # True if sliding-window truncation was triggered this turn
+    budget_threshold: int  # Token budget upper limit (session-level config, default 8192)
+

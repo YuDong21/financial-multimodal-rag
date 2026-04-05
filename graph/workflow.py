@@ -1,22 +1,29 @@
 """
 LangGraph Workflow for Financial Multimodal RAG.
 
-Complete three-path pipeline:
+Complete three-path pipeline with pre-routing token budget management:
 
   Fast path (COMPLEX_FAST):
-    input → semantic_router → task_decomposition → retrieval_planning
+    input → truncation → semantic_router → task_decomposition → retrieval_planning
       → fast_retrieval → fast_rerank → evidence_check
       → [loop: fast_retrieval | fallback: mcp_tool_call] → generation → verification → end
 
   Slow path (COMPLEX_SLOW):
-    input → semantic_router → slow_retrieval → slow_rerank → generation → verification → end
+    input → truncation → semantic_router → slow_retrieval → slow_rerank → generation → verification → end
 
   Simple path (SIMPLE):
-    input → semantic_router → direct_generation → end
+    input → truncation → semantic_router → direct_generation → end
 
-All paths share the same GraphState schema (graph/state.py).
-Each node is a pure function: state_in → state_out.
-All routing decisions are explicit conditional edge functions.
+TOKEN BUDGET SYSTEM
+-------------------
+TruncationNode runs BEFORE SemanticRouterNode on every request:
+  1. Reads total_tokens_in_context from GraphState
+  2. If total_tokens >= budget_threshold → triggers sliding-window truncation
+  3. Sliding window keeps last K turns verbatim; older turns → Qwen2.5-1.5B compression
+  4. Writes memory_summary and updated short_term_context back to GraphState
+
+GraphState is a GLOBAL parameter — the SAME dict reference is shared by all nodes.
+See graph/state.py for the global-access design rationale.
 """
 
 from __future__ import annotations
@@ -37,7 +44,8 @@ from .state import (
     SubTask,
     ToolCandidate,
     Citation,
-    ConversationTurn,
+)
+from memory.context_manager import TruncationNode, TokenBudgetManager, TruncationPolicy, SemanticTruncator,
 )
 
 # ---------------------------------------------------------------------------
@@ -142,7 +150,9 @@ class InputNode:
             node_errors={},
             short_term_context=[],
             memory_summary=None,
-            total_tokens_used=0,
+            total_tokens_in_context=0,
+            truncation_applied=False,
+            budget_threshold=8192,
         )
 
 
@@ -237,24 +247,36 @@ class DirectGenerationNode:
     """
     Fast-path generation for simple questions.
     Bypasses retrieval entirely — generates directly from conversation history.
+
+    Uses budget_manager.get_context_for_prompt() to get the properly truncated
+    conversation context. The same budget_manager instance is shared across all nodes
+    as a global reference — this is the "global parameter" design.
     """
 
-    def __init__(self, generator: Any, memory_manager: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        generator: Any,
+        budget_manager: Optional[TokenBudgetManager] = None,
+    ) -> None:
         self.generator = generator
-        self.memory_manager = memory_manager
+        self.budget_manager = budget_manager
 
     def run(self, state: GraphState) -> GraphState:
         question = state["question"]
-        context = state.get("short_term_context", [])
+
+        # Add user turn to context
+        context = list(state.get("short_term_context", []))
         context.append({"role": "user", "content": question})
 
         try:
-            context_messages = (
-                self.memory_manager.get_context_for_prompt(query_tokens=500)
-                if self.memory_manager else context
+            # Use budget manager's context (truncated if needed)
+            context_messages, total_tokens = (
+                self.budget_manager.get_context_for_prompt(query_tokens=500)
+                if self.budget_manager else (context, 0)
             )
             response = self.generator.chat(messages=context_messages)
             state["answer_final"] = response.content
+            state["total_tokens_in_context"] = total_tokens
             state["citations"] = []
         except Exception as exc:  # noqa: BLE001
             state["error_message"] = f"Direct generation failed: {exc}"
@@ -825,15 +847,16 @@ class FinancialRAGWorkflow:
 
     Parameters
     ----------
-    router          : QwenRouter (Qwen3-0.6B)
-    generator       : QwenGenerator (Qwen3-8B)
-    retriever       : HybridRetriever (BGE-M3 + BM25 + RRRF)
-    reranker        : BGEReranker
-    judge_model     : Any, optional — LLM for evidence checking (default: router)
-    verification_tools : dict[str, callable], optional — MCP verification tool functions
-    memory_manager  : MemoryManager, optional
-    mcp_tool_registry : dict[str, callable], optional — MCP tool registry
-    session_id     : str, optional
+    router             : QwenRouter (Qwen3-0.6B)
+    generator          : QwenGenerator (Qwen3-8B)
+    retriever          : HybridRetriever (BGE-M3 + BM25 + RRRF)
+    reranker           : BGEReranker
+    judge_model        : Any, optional — LLM for evidence checking (default: router)
+    verification_tools: dict[str, callable], optional — MCP verification tools
+    memory_manager     : MemoryManager, optional — DEPRECATED, use budget_manager
+    budget_manager     : TokenBudgetManager, optional — token budget + truncation
+    mcp_tool_registry  : dict[str, callable], optional — MCP tool registry
+    session_id         : str, optional
     """
 
     def __init__(
@@ -845,6 +868,7 @@ class FinancialRAGWorkflow:
         judge_model: Optional[Any] = None,
         verification_tools: Optional[dict[str, callable]] = None,
         memory_manager: Optional[Any] = None,
+        budget_manager: Optional[TokenBudgetManager] = None,
         mcp_tool_registry: Optional[dict[str, callable]] = None,
         session_id: Optional[str] = None,
     ) -> None:
@@ -858,10 +882,23 @@ class FinancialRAGWorkflow:
         self.mcp_tool_registry = mcp_tool_registry or {}
         self.session_id = session_id or str(uuid.uuid4())
 
-        # Initialize nodes
+        # ── Token Budget Manager (shared global across all nodes) ────────────
+        # The budget_manager is a shared singleton. All nodes access the SAME
+        # instance via this reference, which lives on the workflow object.
+        # TruncationNode reads/writes the same dict in GraphState.
+        self.budget_manager = budget_manager or TokenBudgetManager(
+            policy=TruncationPolicy(
+                budget=8192,
+                k_keep=4,
+                compression_model="qwen2.5-1.5b-instruct",
+            )
+        )
+
+        # ── Initialize all nodes ─────────────────────────────────────────
         self._input = InputNode(session_id=self.session_id)
+        self._truncation = TruncationNode(self.budget_manager)
         self._semantic_router = SemanticRouterNode(router)
-        self._direct_gen = DirectGenerationNode(generator, memory_manager)
+        self._direct_gen = DirectGenerationNode(generator, self.budget_manager)
         self._task_decomp = TaskDecompositionNode(generator)
         self._retrieval_plan = RetrievalPlanningNode()
         self._slow_retrieval = SlowRetrievalNode(retriever)
@@ -880,6 +917,12 @@ class FinancialRAGWorkflow:
 
         # ── Nodes ──────────────────────────────────────────────────────────
         g.add_node("input", lambda state: self._input.run(state["question"]))
+
+        # ── TOKEN BUDGET CHECK — runs BEFORE router on EVERY request ──────────
+        # TruncationNode reads/writes the SAME dict that all other nodes use.
+        # This is the "global parameter" design: one dict, shared reference.
+        g.add_node("truncation", self._truncation.run)
+
         g.add_node("semantic_router", self._semantic_router.run)
         g.add_node("direct_generation", self._direct_gen.run)
         g.add_node("task_decomposition", self._task_decomp.run)
@@ -895,7 +938,12 @@ class FinancialRAGWorkflow:
 
         # ── Entry ───────────────────────────────────────────────────────────
         g.set_entry_point("input")
-        g.add_edge("input", "semantic_router")
+
+        # ── INPUT → TRUNCATION (token budget check) ─────────────────────────
+        g.add_edge("input", "truncation")
+
+        # ── TRUNCATION → ROUTER ─────────────────────────────────────────────
+        g.add_edge("truncation", "semantic_router")
 
         # ── Router → paths ─────────────────────────────────────────────────
         g.add_conditional_edges(
@@ -942,11 +990,20 @@ class FinancialRAGWorkflow:
     def run(self, question: str) -> dict[str, Any]:
         """Execute the full pipeline for a question."""
         initial_state = self._input.run(question)
+
+        # Add current turn to the budget manager's history
+        # (The TruncationNode will read from budget_manager and sync to state)
+        self.budget_manager.add_turn("user", question)
+
         final_state = self.graph.invoke(initial_state)
 
-        if self.memory_manager is not None:
-            self.memory_manager.add_turn("user", question)
-            if final_state.get("answer_final"):
-                self.memory_manager.add_turn("assistant", final_state["answer_final"])
+        # Add assistant answer to budget manager after generation
+        if final_state.get("answer_final"):
+            self.budget_manager.add_turn("assistant", final_state["answer_final"])
+
+        # Sync short_term_context back to state for persistence across runs
+        messages, total_tokens = self.budget_manager.get_context_for_prompt()
+        final_state["short_term_context"] = messages
+        final_state["total_tokens_in_context"] = total_tokens
 
         return dict(final_state)

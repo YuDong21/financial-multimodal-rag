@@ -1,33 +1,33 @@
 """
 graph: LangGraph workflow orchestration for financial multimodal RAG.
 
-Fast path (COMPLEX_FAST):
-  input → router → task_decomposition → retrieval_planning
-  → fast_retrieval → fast_rerank → evidence_check
-  → [loop | mcp_tool_call] → generation → verification → end
+Token Budget Architecture
+------------------------
+input → truncation (TokenBudgetManager) → semantic_router → ...
 
-Slow path (COMPLEX_SLOW):
-  input → router → slow_retrieval → slow_rerank → generation → verification → end
+TruncationNode (memory.context_manager.TruncationNode):
+  - Runs BEFORE semantic_router on every request
+  - Checks: total_tokens_in_context >= budget_threshold?
+  - If YES → sliding window (keep last K turns verbatim)
+            older turns → Qwen2.5-1.5B semantic compression → memory_summary
+  - Writes back to GraphState: short_term_context, memory_summary, total_tokens_in_context
 
-Simple path (SIMPLE):
-  input → router → direct_generation → end
+GraphState as Global Parameter
+------------------------------
+In LangGraph, the GraphState dict is the SINGLE source of truth.
+It is passed by reference (not copied) to every node.
+All nodes read from and write to the SAME dict — writes in one node
+are immediately visible to all downstream nodes within a session.
 
-GraphState fields (graph/state.py):
-  - question, query_rewritten, original_question
-  - route (SIMPLE/SLOW/FAST), routing_reasoning, task_type
-  - sub_tasks, retrieval_queries, retrieval_strategy
-  - slow/fast_retrieved_docs, slow/fast_reranked_docs
-  - evidence_snippets, evidence_score, evidence_reasoning
-  - fallback_triggered, fallback_count
-  - candidate_tools, tool_call_results
-  - answer_draft, answer_final, citations, answer_groundedness_score
-  - error_message, node_errors
-  - short_term_context, memory_summary, total_tokens_used
+The budget_manager (TokenBudgetManager) is a shared singleton on the
+workflow object. TruncationNode and DirectGenerationNode both hold
+references to the SAME budget_manager instance.
 """
 
 from .workflow import (
     FinancialRAGWorkflow,
     InputNode,
+    TruncationNode,
     SemanticRouterNode,
     DirectGenerationNode,
     TaskDecompositionNode,
@@ -51,13 +51,13 @@ from .state import (
     SubTask,
     ToolCandidate,
     Citation,
-    ConversationTurn,
 )
 
 __all__ = [
     # Workflow
     "FinancialRAGWorkflow",
     "InputNode",
+    "TruncationNode",
     "SemanticRouterNode",
     "DirectGenerationNode",
     "TaskDecompositionNode",
@@ -70,7 +70,7 @@ __all__ = [
     "MCPToolNode",
     "GenerationNode",
     "VerificationNode",
-    # State types
+    # State
     "GraphState",
     "Route",
     "RetrievalStrategy",
@@ -80,5 +80,4 @@ __all__ = [
     "SubTask",
     "ToolCandidate",
     "Citation",
-    "ConversationTurn",
 ]
