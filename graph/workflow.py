@@ -1,239 +1,106 @@
 """
 LangGraph Workflow for Financial Multimodal RAG.
 
-Implements a state machine with two distinct complex paths sharing the same entry:
+Complete three-path pipeline:
 
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                         QUERY INPUT                             │
-  └─────────────────────────┬───────────────────────────────────────┘
-                            │
-                            ▼
-  ┌─────────────────────────────────────────────────────────────────┐
-  │              SEMANTIC ROUTER  (Qwen3-0.6B)                     │
-  │  simple  →  DIRECT_GENERATION ──────────────────────────────┐   │
-  │  complex (slow) → SLOW_RETRIEVAL ──────────────────────┐   │   │
-  │  complex (fast) → TASK_DECOMPOSITION ──────────────┐   │   │   │
-  └──────────────────────────────────────────────────┘   │   │   │
-      │                                               │   │   │   │
-      │ slow_complex                                  │   │   │   │
-      │                                               ▼   ▼   │   │
-      │                              ┌─────────────────────────┤   │
-      │                              │  SLOW_RETRIEVAL (hybrid) │   │
-      │                              │  BGE-M3 + BM25 + RRRF    │   │
-      │                              └────────────┬────────────┘   │
-      │                                           │                │
-      │                                           ▼                │
-      │                              ┌─────────────────────────┤   │
-      │                              │  SLOW_RERANK            │   │
-      │                              │  BGE-Reranker v2        │   │
-      │                              └────────────┬────────────┘   │
-      │                                           │                │
-      │                                           ▼                │
-      │                                    GENERATION              │
-      │                                         │                  │
-      ├─────────────────────────────────────────┼──────────────────┤
-      │ fast_complex                            │                  │
-      │                                         ▼                  │
-      │                         ┌─────────────────────────┐          │
-      │                         │  TASK_DECOMPOSITION      │          │
-      │                         │  (sub-task planning)     │          │
-      │                         └────────────┬────────────┘          │
-      │                                      │                       │
-      │                                      ▼                       │
-      │                         ┌─────────────────────────┐          │
-      │                         │  RETRIEVAL_PLANNING      │          │
-      │                         │  (route per modality)    │          │
-      │                         └────────────┬────────────┘          │
-      │                                      │                       │
-      │                                      ▼                       │
-      │                         ┌─────────────────────────┐          │
-      │                         │  FAST_RETRIEVAL         │          │
-      │                         │  (multi-query, hybrid)  │          │
-      │                         └────────────┬────────────┘          │
-      │                                      │                       │
-      │                                      ▼                       │
-      │                         ┌─────────────────────────┐          │
-      │                         │  EVIDENCE_SUFFICIENCY   │          │
-      │                         └────────────┬────────────┘          │
-      │           ┌─────────────────────────┼───────────────────┐  │
-      │           │ insufficient            │ sufficient         │  │
-      │           ▼                         ▼                     │  │
-      │  ┌───────────────┐         ┌─────────────────┐            │  │
-      │  │FAST_RETRIEVAL│         │  MCP_TOOL_CALL  │            │  │
-      │  │  (loop back)  │         │  (DeepDoc/Calc) │            │  │
-      │  └───────┬───────┘         └────────┬────────┘            │  │
-      │          │                          │                     │  │
-      │          └──────────────────────────┴─────────────────────┘  │
-      │                               │                               │
-      │                               ▼                               │
-      │                        GENERATION  ──────────────────────── END
-      └─────────────────────────────────────────────────────────────┘
+  Fast path (COMPLEX_FAST):
+    input → semantic_router → task_decomposition → retrieval_planning
+      → fast_retrieval → fast_rerank → evidence_check
+      → [loop: fast_retrieval | fallback: mcp_tool_call] → generation → verification → end
 
-Key Design Decisions
---------------------
-1. **Separate slow/fast retrieval nodes** — Each complex path has its own
-   isolated retrieval + rerank chain, preventing state pollution between paths.
-2. **Conditional edges** — Every routing decision is an explicit function,
-   fully inspectable and loggable.
-3. **Evidence loop with circuit breaker** — Fast path loops FAST_RETRIEVAL →
-   EVIDENCE_CHECK up to MAX_EVIDENCE_RETRIES times before forcing MCP tool use.
-4. **Citation-aware generation** — Single shared GenerationNode for both paths.
+  Slow path (COMPLEX_SLOW):
+    input → semantic_router → slow_retrieval → slow_rerank → generation → verification → end
+
+  Simple path (SIMPLE):
+    input → semantic_router → direct_generation → end
+
+All paths share the same GraphState schema (graph/state.py).
+Each node is a pure function: state_in → state_out.
+All routing decisions are explicit conditional edge functions.
 """
 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Annotated, Any, Literal, Optional, TypedDict
+from typing import Annotated, Any, Literal, Optional
 
 import operator
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
+
+from .state import (
+    GraphState,
+    Route,
+    RetrievalStrategy,
+    TaskType,
+    FallbackReason,
+    RetrievedDoc,
+    SubTask,
+    ToolCandidate,
+    Citation,
+    ConversationTurn,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_EVIDENCE_RETRIES: int = 2  # Circuit breaker for fast-path evidence loop
+MAX_EVIDENCE_RETRIES = 2  # Circuit breaker for fast-path evidence loop
 
 
 # ---------------------------------------------------------------------------
-# Enums
+# Conditional Edge Functions
 # ---------------------------------------------------------------------------
 
-class Route(str, Enum):
-    """Possible routes from the SemanticRouter node."""
-
-    SIMPLE = "simple"
-    COMPLEX_SLOW = "slow"
-    COMPLEX_FAST = "fast"
-
-
-class RetrievalStrategy(str, Enum):
-    """Modality routing for retrieval planning."""
-
-    TEXT = "text"
-    TABLE = "table"
-    FIGURE = "figure"
-    ALL = "all"
-
-
-# ---------------------------------------------------------------------------
-# Data Classes
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RetrievedDoc:
-    """A retrieved document chunk with source metadata for citation."""
-
-    chunk_id: str
-    text: str
-    source_doc: str
-    page_number: int
-    retrieval_strategy: RetrievalStrategy
-
-    # Optional per-node scores (used for logging/debugging)
-    dense_score: float = 0.0
-    sparse_score: float = 0.0
-    rerank_score: float = 0.0
-
-
-@dataclass
-class ToolCall:
-    """A planned or executed MCP tool call."""
-
-    tool_name: str
-    arguments: dict[str, Any]
-    result: Any = None
-    error: Optional[str] = None
-
-
-@dataclass
-class SubTask:
-    """A single sub-task produced by task decomposition."""
-
-    task_id: str
-    description: str
-    strategy: RetrievalStrategy
-    key_terms: list[str]
-
-
-# ---------------------------------------------------------------------------
-# Graph State
-# ---------------------------------------------------------------------------
-
-class GraphState(TypedDict, total=False):
+def route_after_semantic_router(state: GraphState) -> str:
     """
-    Shared state carried through the LangGraph pipeline.
-    All fields are optional — each node reads/writes only what it needs.
+    Conditional edge: decide next node based on semantic router output.
+
+    SIMPLE  → direct_generation (no retrieval)
+    SLOW    → slow_retrieval (full retrieval, no planning)
+    FAST    → task_decomposition (full fast path)
     """
+    route = state.get("route")
+    if route == Route.SIMPLE:
+        return "direct_generation"
+    elif route == Route.COMPLEX_SLOW:
+        return "slow_retrieval"
+    return "task_decomposition"
 
-    # --- Input ---
-    question: Annotated[str, operator.add]
-    session_id: str
 
-    # --- Routing ---
-    route: Optional[Route]
-    routing_reasoning: Optional[str]
+def route_after_evidence_check(state: GraphState) -> str:
+    """
+    Conditional edge: fast path — loop back or trigger fallback.
 
-    # --- Task Decomposition ---
-    sub_tasks: list[SubTask]
+    If evidence is insufficient AND attempts < MAX_EVIDENCE_RETRIES → loop to fast_retrieval
+    If evidence is insufficient AND attempts >= MAX → mcp_tool_call
+    If evidence is sufficient → mcp_tool_call (tools may still be needed for calc)
+    """
+    sufficient = state.get("evidence_score", 0.0) >= 0.7
+    attempts = state.get("fast_retrieval_attempts", 0)
 
-    # --- Retrieval Planning ---
-    retrieval_strategy: RetrievalStrategy
+    if not sufficient and attempts < MAX_EVIDENCE_RETRIES:
+        return "fast_retrieval"  # Loop back
 
-    # --- Slow Path ---
-    slow_retrieved_docs: list[RetrievedDoc]
-    slow_reranked_docs: list[RetrievedDoc]
+    return "mcp_tool_call"
 
-    # --- Fast Path ---
-    fast_retrieved_docs: list[RetrievedDoc]
-    fast_evidence_sufficient: bool
-    fast_evidence_reasoning: Optional[str]
-    fast_retrieval_attempts: int  # Tracks loop iterations for circuit breaker
-    fast_reranked_docs: list[RetrievedDoc]
 
-    # --- MCP ---
-    tool_calls: list[ToolCall]
+def route_after_mcp_tools(state: GraphState) -> str:
+    """
+    Conditional edge: after MCP tools, route back to generation.
 
-    # --- Generation ---
-    answer: Optional[str]
-    citations: list[dict[str, Any]]
-
-    # --- Memory ---
-    conversation_history: list[dict[str, str]]
-
-    # --- Error ---
-    error_message: Optional[str]
+    After tool execution, always go to generation.
+    The circuit breaker is handled in route_after_evidence_check.
+    """
+    return "generation"
 
 
 # ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def deduplicate_docs(docs: list[RetrievedDoc]) -> list[RetrievedDoc]:
-    """Remove duplicate chunks by chunk_id, preserving order."""
-    seen: set[str] = set()
-    unique: list[RetrievedDoc] = []
-    for d in docs:
-        if d.chunk_id not in seen:
-            seen.add(d.chunk_id)
-            unique.append(d)
-    return unique
-
-
-def _make_state(**kwargs: Any) -> GraphState:
-    """Create a GraphState dict with defaults."""
-    return GraphState(**kwargs)
-
-
-# ---------------------------------------------------------------------------
-# Node: Input Initialization
+# Node: Input
 # ---------------------------------------------------------------------------
 
 class InputNode:
     """
-    Initializes the graph state from a raw user question.
+    Initializes the GraphState from a raw user question.
 
     This is the canonical entry point — every query first passes through here
     before reaching the semantic router.
@@ -243,36 +110,39 @@ class InputNode:
         self.session_id = session_id or str(uuid.uuid4())
 
     def run(self, question: str) -> GraphState:
-        """
-        Initialize and return the starting state.
-
-        Parameters
-        ----------
-        question : str
-
-        Returns
-        -------
-        GraphState with ``question`` and ``session_id`` set.
-        """
-        return _make_state(
+        return GraphState(
             question=question,
             session_id=self.session_id,
+            original_question=question,
+            query_rewritten=None,
             route=None,
             routing_reasoning=None,
+            task_type=None,
             sub_tasks=[],
+            current_task_index=0,
+            retrieval_queries=[],
             retrieval_strategy=RetrievalStrategy.ALL,
             slow_retrieved_docs=[],
             slow_reranked_docs=[],
             fast_retrieved_docs=[],
-            fast_evidence_sufficient=False,
-            fast_evidence_reasoning=None,
-            fast_retrieval_attempts=0,
             fast_reranked_docs=[],
-            tool_calls=[],
-            answer=None,
+            fast_retrieval_attempts=0,
+            evidence_snippets=[],
+            evidence_score=None,
+            evidence_reasoning=None,
+            fallback_triggered=FallbackReason.NONE,
+            fallback_count=0,
+            candidate_tools=[],
+            tool_call_results=[],
+            answer_draft=None,
+            answer_final=None,
             citations=[],
-            conversation_history=[],
+            answer_groundedness_score=None,
             error_message=None,
+            node_errors={},
+            short_term_context=[],
+            memory_summary=None,
+            total_tokens_used=0,
         )
 
 
@@ -282,54 +152,52 @@ class InputNode:
 
 class SemanticRouterNode:
     """
-    Classifies the incoming question into ``simple``, ``slow``, or ``fast``.
+    Classifies the question into SIMPLE / SLOW / FAST using Qwen3-0.6B.
 
-    Uses Qwen3-0.6B (lightweight, low-latency) to decide the execution path:
-
-      simple  — Single-hop factual question. Bypass retrieval entirely.
-      slow    — Multi-hop or cross-temporal question requiring full retrieval
-                pipeline but no iterative planning/verification.
-      fast    — Complex question requiring task decomposition, retrieval
-                planning, and evidence verification loop.
+    Also sets the TaskType based on the question's analytical intent.
     """
 
     ROUTER_PROMPT = """You are a semantic query router for a financial RAG system.
-Given a user's question about financial reports, classify it into exactly ONE of
-three categories:
 
-  simple  — A direct factual question answerable from a single document chunk.
-             No sub-task planning needed. Examples:
-             "What was Apple's revenue in FY2024?", "What does page 5 say about net profit?"
+Classify the question into exactly ONE of three categories:
 
-  slow    — A multi-hop, comparative, or cross-temporal question that needs full
-             retrieval and reranking, but does NOT need iterative sub-task planning
-             or evidence verification loops. Examples:
-             "Compare Apple's revenue trend over the past 3 years",
-             "What is the average ROE across all quarters in 2024?"
+  simple  — Single-hop factual question. No sub-task planning needed.
+             Example: "What was Apple's revenue in FY2024?"
 
-  fast    — A complex question that requires decomposing into sub-tasks,
-             planning retrieval strategies per modality (text/table/figure),
-             and verifying evidence sufficiency before generating. Examples:
-             "Summarize the key risk factors in the ESG report and calculate the
-              debt-to-equity ratio across all peer companies",
-             "Identify all cross-page tables about revenue and compute CAGR
-              for the last 5 years"
+  slow    — Multi-hop or comparative question requiring full retrieval
+             and reranking, but does NOT need iterative planning loops.
+             Examples: "Compare Apple's revenue vs. Microsoft over 3 years",
+                       "What is the average ROE across all quarters in 2024?"
 
-Reply with ONLY one word: simple | slow | fast — no explanation, no punctuation."""  # noqa: E501
+  fast    — Complex question requiring task decomposition, per-modality
+             retrieval planning, and evidence sufficiency verification.
+             Examples: "Summarize risk factors and calculate D/E ratio",
+                       "Find all cross-page tables about revenue and compute CAGR"
+
+Reply with ONLY one word: simple | slow | fast"""  # noqa: E501
+
+    TASK_TYPE_PROMPT = """Given the user's question, classify its analytical intent
+into one of: factual_query | comparative | trend | risk | financial_calc | cross_table | unknown
+
+Examples:
+  "What was revenue?" → factual_query
+  "Compare A vs B" → comparative
+  "How has ROE changed over 5 years?" → trend
+  "What are the risk factors?" → risk
+  "Calculate D/E ratio" → financial_calc
+  "Combine revenue and margin data" → cross_table
+
+Reply with ONLY the category name."""
 
     def __init__(self, router: Any) -> None:
         self.router = router
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Classify the question and write ``route`` into state.
-        """
         question = state["question"]
+        messages = [{"role": "system", "content": self.ROUTER_PROMPT},
+                    {"role": "user", "content": question}]
+
         try:
-            messages = [
-                {"role": "system", "content": self.ROUTER_PROMPT},
-                {"role": "user", "content": question},
-            ]
             response = self.router.chat(messages=messages)
             label = response.content.strip().lower()
 
@@ -342,8 +210,22 @@ Reply with ONLY one word: simple | slow | fast — no explanation, no punctuatio
 
             state["routing_reasoning"] = response.content
         except Exception as exc:  # noqa: BLE001
-            state["route"] = Route.COMPLEX_SLOW  # Fail to slow path on error
-            state["routing_reasoning"] = f"Routing error: {exc}"
+            state["route"] = Route.COMPLEX_SLOW
+            state["routing_reasoning"] = f"Router error: {exc}"
+
+        # Classify task type
+        task_messages = [{"role": "system", "content": self.TASK_TYPE_PROMPT},
+                         {"role": "user", "content": question}]
+        try:
+            task_response = self.router.chat(messages=task_messages)
+            raw_type = task_response.content.strip().lower()
+            try:
+                state["task_type"] = TaskType(raw_type)
+            except ValueError:
+                state["task_type"] = TaskType.UNKNOWN
+        except Exception:  # noqa: BLE001
+            state["task_type"] = TaskType.UNKNOWN
+
         return state
 
 
@@ -353,10 +235,8 @@ Reply with ONLY one word: simple | slow | fast — no explanation, no punctuatio
 
 class DirectGenerationNode:
     """
-    Fast-path generation for simple, single-hop questions.
-
-    Bypasses retrieval entirely and generates directly from conversation history.
-    Uses Qwen3-8B for quality. No citations (no retrieval was performed).
+    Fast-path generation for simple questions.
+    Bypasses retrieval entirely — generates directly from conversation history.
     """
 
     def __init__(self, generator: Any, memory_manager: Optional[Any] = None) -> None:
@@ -364,21 +244,17 @@ class DirectGenerationNode:
         self.memory_manager = memory_manager
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Generate a direct answer for simple queries.
-        """
         question = state["question"]
-        messages = list(state.get("conversation_history", []))
-        messages.append({"role": "user", "content": question})
+        context = state.get("short_term_context", [])
+        context.append({"role": "user", "content": question})
 
         try:
-            context = (
+            context_messages = (
                 self.memory_manager.get_context_for_prompt(query_tokens=500)
-                if self.memory_manager
-                else messages
+                if self.memory_manager else context
             )
-            response = self.generator.chat(messages=context)
-            state["answer"] = response.content
+            response = self.generator.chat(messages=context_messages)
+            state["answer_final"] = response.content
             state["citations"] = []
         except Exception as exc:  # noqa: BLE001
             state["error_message"] = f"Direct generation failed: {exc}"
@@ -393,62 +269,38 @@ class TaskDecompositionNode:
     """
     Decomposes a complex fast-path question into parallel sub-tasks.
 
-    Each sub-task carries a ``strategy`` (text/table/figure) so that
-    RetrievalPlanningNode can route each to the appropriate modality.
-
-    Uses Qwen3-0.6B for lightweight planning.
+    Each SubTask carries: task_id, description, strategy, key_terms.
     """
 
-    PLANNER_PROMPT = """You are a query planner for a financial RAG system.
-Given the user's complex question, break it down into N independent sub-tasks.
+    PLANNER_PROMPT = """Break this complex question into N independent sub-tasks.
 
-For each sub-task provide:
-  1. task_id — A unique string identifier (e.g. "t1", "t2")
-  2. description — What specific information does this sub-task need?
-  3. strategy — One of: text | table | figure | all
-     - Use "table" if the answer requires financial table data (revenue, ROE, etc.)
-     - Use "figure" if the answer requires chart / figure caption data
-     - Use "text" for qualitative descriptions (risk factors, management discussion)
-     - Use "all" when no specific modality is dominant
-  4. key_terms — List of important financial terms / numbers to search for
-
-Output format (JSON array only, no markdown):
+Output JSON array:
 [
-  {"task_id": "t1", "description": "...", "strategy": "table", "key_terms": ["revenue", "FY2024"]},
-  {"task_id": "t2", "description": "...", "strategy": "text", "key_terms": ["risk factor"]}
-]"""  # noqa: E501
+  {"task_id": "t1", "description": "...", "strategy": "text|table|figure|all", "key_terms": ["..."]},
+  ...
+]
+
+Rules:
+- strategy: "table" if the answer needs numeric table data
+           "text" if qualitative (risk factors, discussion)
+           "figure" if charts/graphs are needed
+           "all" if no specific modality dominates
+- Include all key financial terms, company names, years in key_terms
+- Each sub-task should be answerable independently"""
 
     def __init__(self, generator: Any) -> None:
         self.generator = generator
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Decompose the question into sub-tasks.
-        """
         import json
-
         question = state["question"]
-        messages = [
-            {"role": "system", "content": self.PLANNER_PROMPT},
-            {"role": "user", "content": question},
-        ]
+        messages = [{"role": "system", "content": self.PLANNLER_PROMPT},
+                    {"role": "user", "content": question}]
 
         try:
             response = self.generator.chat(messages=messages)
             raw = response.content.strip()
-            try:
-                raw_tasks = json.loads(raw)
-            except json.JSONDecodeError:
-                raw_tasks = [
-                    {
-                        "task_id": "t0",
-                        "description": question,
-                        "strategy": "all",
-                        "key_terms": [],
-                    }
-                ]
-
-            # Normalize to SubTask dataclasses
+            raw_tasks = json.loads(raw) if raw.startswith("[") else []
             sub_tasks = [
                 SubTask(
                     task_id=t["task_id"],
@@ -460,7 +312,7 @@ Output format (JSON array only, no markdown):
             ]
             state["sub_tasks"] = sub_tasks
         except Exception as exc:  # noqa: BLE001
-            state["error_message"] = f"Task decomposition failed: {exc}"
+            state["node_errors"]["task_decomposition"] = str(exc)
             state["sub_tasks"] = [
                 SubTask(
                     task_id="t0",
@@ -478,43 +330,41 @@ Output format (JSON array only, no markdown):
 
 class RetrievalPlanningNode:
     """
-    Routes each sub-task to its target modality (text / table / figure / all).
+    Analyzes sub-tasks and sets the dominant retrieval strategy.
 
-    This node reads ``sub_tasks`` from state and sets per-task routing
-    decisions. The actual retrieval is delegated to FastRetrievalNode which
-    respects these decisions.
-
-    Also handles the case where the overall retrieval strategy is set to a
-    dominant modality based on task analysis.
+    Builds per-sub-task retrieval query strings and stores them
+    in ``retrieval_queries``.
     """
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Analyze sub-tasks and determine the dominant retrieval strategy.
-
-        If most sub-tasks target the same modality, set it as the global
-        retrieval strategy. Otherwise default to ALL.
-        """
         sub_tasks = state.get("sub_tasks", [])
         if not sub_tasks:
-            state["retrieval_strategy"] = RetrievalStrategy.ALL
+            state["retrieval_queries"] = [state["question"]]
             return state
 
-        # Count modality distribution across sub-tasks
+        # Count modality distribution
         strategy_counts: dict[RetrievalStrategy, int] = {}
         for task in sub_tasks:
             s = RetrievalStrategy(task.strategy)
             strategy_counts[s] = strategy_counts.get(s, 0) + 1
 
-        dominant = max(strategy_counts, key=strategy_counts.get)  # type: ignore
-        # If "all" is dominant, default to ALL; otherwise use dominant
+        dominant = max(strategy_counts, key=strategy_counts.get)
         if dominant == RetrievalStrategy.ALL and len(strategy_counts) > 1:
-            # Find the most common non-ALL strategy
             non_all = {k: v for k, v in strategy_counts.items() if k != RetrievalStrategy.ALL}
             if non_all:
                 dominant = max(non_all, key=non_all.get)
 
         state["retrieval_strategy"] = dominant
+
+        # Build retrieval queries for each sub-task
+        queries: list[str] = []
+        for task in sub_tasks:
+            q = task.description
+            if task.key_terms:
+                q = f"{q} ({', '.join(task.key_terms)})"
+            queries.append(q)
+
+        state["retrieval_queries"] = queries
         return state
 
 
@@ -524,22 +374,13 @@ class RetrievalPlanningNode:
 
 class SlowRetrievalNode:
     """
-    Hybrid dual-branch retrieval for the slow complex path.
-
-    Executes BGE-M3 dense + BM25 sparse retrieval in parallel,
-    fuses ranks via RRRF, and returns top-K chunks WITHOUT a separate
-    re-rank step (reranking is handled by SlowRerankNode).
+    Hybrid retrieval for the slow complex path (single query, no decomposition).
     """
 
     def __init__(self, retriever: Any) -> None:
         self.retriever = retriever
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Execute hybrid retrieval for the slow path.
-
-        Uses the full question as a single query (no sub-task decomposition).
-        """
         question = state["question"]
         try:
             chunks = self.retriever.retrieve(query=question, mode="hybrid")
@@ -563,24 +404,16 @@ class SlowRetrievalNode:
 
 
 # ---------------------------------------------------------------------------
-# Node: Slow Rerank (Slow Path)
+# Node: Slow Rerank
 # ---------------------------------------------------------------------------
 
 class SlowRerankNode:
-    """
-    Re-ranks slow-path documents using BGE-Reranker v2.
-
-    Takes the output of SlowRetrievalNode and re-scores with a
-    cross-encoder for precision.
-    """
+    """Re-ranks slow-path documents using BGE-Reranker."""
 
     def __init__(self, reranker: Any) -> None:
         self.reranker = reranker
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Re-rank slow-path documents with the cross-encoder.
-        """
         docs = state.get("slow_retrieved_docs", [])
         if not docs:
             state["slow_reranked_docs"] = []
@@ -590,102 +423,72 @@ class SlowRerankNode:
         texts = [d.text for d in docs]
 
         try:
-            reranked_indices = self.reranker.rerank(question, texts, top_k=len(texts))
-            reranked: list[RetrievedDoc] = []
-            for idx, score in reranked_indices:
-                doc = docs[idx]
-                doc.rerank_score = float(score)
-                reranked.append(doc)
+            reranked_idx = self.reranker.rerank(question, texts, top_k=len(texts))
+            reranked = []
+            for idx, score in reranked_idx:
+                d = docs[idx]
+                d.rerank_score = float(score)
+                reranked.append(d)
             state["slow_reranked_docs"] = reranked
         except Exception as exc:  # noqa: BLE001
-            state["slow_reranked_docs"] = docs  # Fallback to pre-rerank order
-            state["error_message"] = f"Slow rerank failed: {exc}"
+            state["slow_reranked_docs"] = docs
+            state["node_errors"]["slow_rerank"] = str(exc)
         return state
 
 
 # ---------------------------------------------------------------------------
-# Node: Fast Retrieval (Fast Path — supports sub-task multi-query)
+# Node: Fast Retrieval (Fast Path — multi-query)
 # ---------------------------------------------------------------------------
 
 class FastRetrievalNode:
     """
-    Hybrid retrieval for the fast complex path.
-
-    Retrieves documents for each sub-task in parallel using multi-query
-    retrieval (``retriever.retrieve_multi_query``), then merges results
-    via RRRF. Respects the ``retrieval_strategy`` set by
-    RetrievalPlanningNode for per-modality routing.
+    Multi-query retrieval for the fast complex path.
+    Uses retrieve_multi_query to handle decomposed sub-tasks in parallel.
     """
 
     def __init__(self, retriever: Any) -> None:
         self.retriever = retriever
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Execute hybrid retrieval across all sub-tasks.
-        """
-        sub_tasks = state.get("sub_tasks", [])
-        question = state["question"]
+        queries = state.get("retrieval_queries", [])
         strategy = state.get("retrieval_strategy", RetrievalStrategy.ALL)
 
-        # Build per-task queries
-        queries = []
-        for task in sub_tasks:
-            query = task.description
-            if task.key_terms:
-                query = f"{query} ({', '.join(task.key_terms)})"
-            queries.append(query)
+        if not queries:
+            queries = [state["question"]]
 
         try:
-            if queries:
-                chunks = self.retriever.retrieve_multi_query(queries, mode="hybrid")
-            else:
-                # Fallback: single query with full question
-                chunks = self.retriever.retrieve(query=question, mode="hybrid")
-
-            docs: list[RetrievedDoc] = []
-            for c in chunks:
-                # Annotate each doc with the task's strategy
-                docs.append(
-                    RetrievedDoc(
-                        chunk_id=c.chunk_id,
-                        text=c.text,
-                        source_doc=c.source_doc,
-                        page_number=c.page_number,
-                        retrieval_strategy=strategy,
-                        dense_score=getattr(c, "dense_score", 0.0),
-                        sparse_score=getattr(c, "sparse_score", 0.0),
-                    )
+            chunks = self.retriever.retrieve_multi_query(queries=queries, mode="hybrid")
+            docs: list[RetrievedDoc] = [
+                RetrievedDoc(
+                    chunk_id=c.chunk_id,
+                    text=c.text,
+                    source_doc=c.source_doc,
+                    page_number=c.page_number,
+                    retrieval_strategy=strategy,
+                    dense_score=getattr(c, "dense_score", 0.0),
+                    sparse_score=getattr(c, "sparse_score", 0.0),
                 )
-
-            # Deduplicate
-            state["fast_retrieved_docs"] = deduplicate_docs(docs)
-            # Increment attempt counter for circuit breaker
+                for c in chunks
+            ]
+            state["fast_retrieved_docs"] = deduplicate(docs)
             state["fast_retrieval_attempts"] = state.get("fast_retrieval_attempts", 0) + 1
         except Exception as exc:  # noqa: BLE001
-            state["error_message"] = f"Fast retrieval failed: {exc}"
+            state["node_errors"]["fast_retrieval"] = str(exc)
             state["fast_retrieved_docs"] = []
         return state
 
 
 # ---------------------------------------------------------------------------
-# Node: Fast Rerank (Fast Path)
+# Node: Fast Rerank
 # ---------------------------------------------------------------------------
 
 class FastRerankNode:
-    """
-    Re-ranks fast-path documents using BGE-Reranker v2.
-
-    Re-scores the output of FastRetrievalNode with a cross-encoder.
-    """
+    """Re-ranks fast-path documents using BGE-Reranker."""
 
     def __init__(self, reranker: Any) -> None:
         self.reranker = reranker
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Re-rank fast-path documents.
-        """
         docs = state.get("fast_retrieved_docs", [])
         if not docs:
             state["fast_reranked_docs"] = []
@@ -695,144 +498,198 @@ class FastRerankNode:
         texts = [d.text for d in docs]
 
         try:
-            reranked_indices = self.reranker.rerank(question, texts, top_k=len(texts))
-            reranked: list[RetrievedDoc] = []
-            for idx, score in reranked_indices:
-                doc = docs[idx]
-                doc.rerank_score = float(score)
-                reranked.append(doc)
+            reranked_idx = self.reranker.rerank(question, texts, top_k=len(texts))
+            reranked = []
+            for idx, score in reranked_idx:
+                d = docs[idx]
+                d.rerank_score = float(score)
+                reranked.append(d)
             state["fast_reranked_docs"] = reranked
         except Exception as exc:  # noqa: BLE001
             state["fast_reranked_docs"] = docs
-            state["error_message"] = f"Fast rerank failed: {exc}"
+            state["node_errors"]["fast_rerank"] = str(exc)
         return state
 
 
 # ---------------------------------------------------------------------------
-# Node: Evidence Sufficiency Check (Fast Path)
+# Node: Evidence Sufficiency Check
 # ---------------------------------------------------------------------------
 
 class EvidenceSufficiencyNode:
     """
-    Judges whether the retrieved documents sufficiently answer the query.
+    Judges whether retrieved documents sufficiently answer the query.
 
-    Uses a lightweight LLM call. If evidence is insufficient, the fast path
-    loops back to FastRetrievalNode for up to MAX_EVIDENCE_RETRIES attempts.
-    After the circuit breaker triggers, forces MCP tool use.
+    Sets ``evidence_score`` (0.0–1.0) and ``evidence_reasoning`` in state.
+    Used by route_after_evidence_check to decide loop vs. fallback.
     """
 
-    CHECK_PROMPT = """You are an evidence sufficiency judge.
-Given the user's question and a list of retrieved document excerpts, determine
-whether the retrieved documents contain sufficient evidence to fully answer
-the question.
+    CHECK_PROMPT = """Judge whether the retrieved documents can sufficiently answer the question.
 
-Respond with EXACTLY one word:
-  SUFFICIENT — The documents provide enough information.
-  INSUFFICIENT — More retrieval or tools are needed.
+Respond with:
+  SUFFICIENT (confidence 0.7-1.0) — Evidence covers the key facts
+  INSUFFICIENT (confidence 0.0-0.6) — Key facts are missing
 
 Question: {question}
 
-Documents:
-{docs}
+Evidence:
+{evidence}
 
-Verdict:"""  # noqa: E501
+Confidence score (0.0-1.0) and brief reasoning:"""  # noqa: E501
 
     def __init__(self, judge_model: Any) -> None:
         self.judge_model = judge_model
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Judge evidence sufficiency and write result to state.
-        """
         docs = state.get("fast_reranked_docs", [])
         question = state["question"]
-        attempts = state.get("fast_retrieval_attempts", 0)
 
         if not docs:
-            state["fast_evidence_sufficient"] = False
-            state["fast_evidence_reasoning"] = "No documents retrieved."
+            state["evidence_score"] = 0.0
+            state["evidence_reasoning"] = "No documents retrieved."
             return state
 
-        docs_text = "\n\n".join(
+        evidence_text = "\n\n".join(
             f"[{i+1}] {d.text[:300]}" for i, d in enumerate(docs[:10])
         )
-        prompt = self.CHECK_PROMPT.format(question=question, docs=docs_text)
+        prompt = self.CHECK_PROMPT.format(question=question, evidence=evidence_text)
 
         try:
             response = self.judge_model.chat(
                 messages=[{"role": "user", "content": prompt}],
-                generation_config=Any(temperature=0.0, top_p=1.0, max_tokens=10),  # type: ignore
+                generation_config=Any(temperature=0.0, top_p=1.0, max_tokens=256),  # type: ignore
             )
-            verdict = response.content.strip().upper()
-            state["fast_evidence_sufficient"] = "SUFFICIENT" in verdict
-            state["fast_evidence_reasoning"] = response.content
+            raw = response.content.strip().upper()
+            sufficient = "SUFFICIENT" in raw
+
+            # Try to extract a numeric confidence
+            import re
+            conf_match = re.search(r"0\.\d+", raw)
+            confidence = float(conf_match.group()) if conf_match else (0.8 if sufficient else 0.3)
+
+            state["evidence_score"] = confidence if sufficient else min(confidence, 0.6)
+            state["evidence_reasoning"] = response.content[:200]
         except Exception as exc:  # noqa: BLE001
-            # Fail open on error — let the circuit breaker handle it
-            state["fast_evidence_sufficient"] = True
-            state["fast_evidence_reasoning"] = f"Judgment error: {exc}"
+            state["evidence_score"] = 0.5
+            state["evidence_reasoning"] = f"Check error: {exc}"
 
         return state
 
 
 # ---------------------------------------------------------------------------
-# Node: MCP Tool Call (Fast Path)
+# Node: MCP Tool Call (Fallback)
 # ---------------------------------------------------------------------------
 
 class MCPToolNode:
     """
     Invokes MCP tools when the fast-path evidence loop is exhausted
-    or when retrieval results are missing/modality-deficient.
+    or when specific capabilities (table parsing, calculation) are needed.
 
-    Available tools:
-    - deepdoc_analysis  — RAGFlow DeepDoc for cross-page table parsing
-    - financial_calc    — Financial ratio / formula calculator
+    Tools are selected based on:
+    - evidence_score (if insufficient → retrieval augmentation tools)
+    - task_type (if financial_calc → analysis tools)
+    - retrieval gaps (if no table docs → deepdoc_tools)
     """
 
-    def __init__(self, mcp_tool_registry: Optional[dict[str, Any]] = None) -> None:
+    def __init__(self, mcp_tool_registry: Optional[dict[str, callable]] = None) -> None:
         self.tools = mcp_tool_registry or {}
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Execute MCP tool calls and augment the document set.
-        """
         docs = list(state.get("fast_reranked_docs", []))
         question = state["question"]
+        task_type = state.get("task_type", TaskType.UNKNOWN)
+        evidence_score = state.get("evidence_score", 0.0)
 
-        tool_calls: list[ToolCall] = []
+        candidates: list[ToolCandidate] = []
+        selected_results: list[ToolCandidate] = []
 
-        # Decide which tools to invoke based on retrieval gaps
-        table_docs = [d for d in docs if d.retrieval_strategy == RetrievalStrategy.TABLE]
-
-        if not docs:
-            # No results at all — try DeepDoc layout analysis
-            tool_calls.append(
-                ToolCall(tool_name="deepdoc_analysis", arguments={"query": question})
+        # Strategy 1: Evidence insufficient → try hybrid retrieval augmentation
+        if evidence_score < 0.7:
+            candidates.append(
+                ToolCandidate(
+                    tool_name="retrieval_hybrid_search",
+                    reason="Evidence score below threshold",
+                    selected=True,
+                    arguments={"query": question, "top_k": 20},
+                )
             )
-        elif not table_docs:
-            # Have text docs but no tables — try financial calculator
-            tool_calls.append(
-                ToolCall(
-                    tool_name="financial_calc",
+
+        # Strategy 2: Financial calculation required
+        if task_type == TaskType.FINANCIAL_CALC:
+            table_docs = [d for d in docs if d.retrieval_strategy == RetrievalStrategy.TABLE]
+            candidates.append(
+                ToolCandidate(
+                    tool_name="analysis_calc",
+                    reason="Task type is financial calculation",
+                    selected=True,
                     arguments={
-                        "table_texts": [],
-                        "query": question,
+                        "metric": "roe",
+                        "values": {},
                     },
                 )
             )
 
-        # Execute each tool
-        for tc in tool_calls:
+        # Strategy 3: No table results but question asks for numbers
+        if task_type in (TaskType.FINANCIAL_CALC, TaskType.COMPARATIVE, TaskType.TREND):
+            has_tables = any(d.retrieval_strategy == RetrievalStrategy.TABLE for d in docs)
+            if not has_tables:
+                candidates.append(
+                    ToolCandidate(
+                        tool_name="deepdoc_table_parse",
+                        reason="No table chunks retrieved but tables needed",
+                        selected=True,
+                        arguments={"query": question, "page_number": 1},
+                    )
+                )
+
+        # Strategy 4: Cross-page table suspected
+        if evidence_score < 0.4:
+            candidates.append(
+                ToolCandidate(
+                    tool_name="deepdoc_cross_page_merge",
+                    reason="Very low evidence score, possible cross-page table",
+                    selected=True,
+                    arguments={"fragments": []},
+                )
+            )
+
+        state["candidate_tools"] = candidates
+
+        # Execute selected tools
+        for tc in candidates:
             tool_fn = self.tools.get(tc.tool_name)
             if tool_fn is None:
-                tc.error = f"Tool '{tc.tool_name}' not registered in MCP registry."
+                tc.error = f"Tool '{tc.tool_name}' not registered."
+                selected_results.append(tc)
                 continue
             try:
-                result = tool_fn(**tc.arguments)
-                tc.result = result
+                tc.result = tool_fn(**tc.arguments)
             except Exception as exc:  # noqa: BLE001
                 tc.error = str(exc)
 
-        state["tool_calls"] = tool_calls
+            selected_results.append(tc)
+
+        state["tool_call_results"] = selected_results
+        state["fallback_count"] = state.get("fallback_count", 0) + 1
+
+        # If any tool returned new docs, merge them
+        new_docs: list[RetrievedDoc] = list(docs)
+        for tc in selected_results:
+            if tc.result and isinstance(tc.result, dict):
+                # Try to extract new chunks from result
+                new_chunks = tc.result.get("results", [])
+                for c in new_chunks:
+                    if isinstance(c, dict) and "chunk_id" in c:
+                        new_docs.append(
+                            RetrievedDoc(
+                                chunk_id=c["chunk_id"],
+                                text=c.get("text", ""),
+                                source_doc=c.get("source_doc", ""),
+                                page_number=c.get("page_number", 1),
+                                retrieval_strategy=RetrievalStrategy.ALL,
+                            )
+                        )
+
+        state["fast_retrieved_docs"] = deduplicate(new_docs)
         return state
 
 
@@ -842,23 +699,16 @@ class MCPToolNode:
 
 class GenerationNode:
     """
-    Final answer generation with inline citation formatting.
+    Shared answer generation node for both slow and fast complex paths.
 
-    Shared by both slow and fast complex paths. Reads from
-    ``slow_reranked_docs`` (slow path) or ``fast_reranked_docs`` (fast path).
+    Reads from slow_reranked_docs (slow path) or fast_reranked_docs (fast path).
+    Sets answer_draft in state (not answer_final — that's set after verification).
     """
 
-    def __init__(self, generator: Any, memory_manager: Optional[Any] = None) -> None:
+    def __init__(self, generator: Any) -> None:
         self.generator = generator
-        self.memory_manager = memory_manager
 
     def run(self, state: GraphState) -> GraphState:
-        """
-        Generate a citation-aware answer.
-
-        Determines which path we are in from the presence of
-        non-empty slow_reranked_docs vs fast_reranked_docs.
-        """
         question = state["question"]
         route = state.get("route", Route.COMPLEX_SLOW)
 
@@ -882,60 +732,85 @@ class GenerationNode:
                 query=question,
                 evidence_chunks=evidence_chunks,
             )
-            state["answer"] = response.content
-            state["citations"] = [
-                {
-                    "source_doc": d.source_doc,
-                    "page_number": d.page_number,
-                    "text": d.text[:200],
-                }
+            state["answer_draft"] = response.content
+
+            # Build citation list from evidence chunks
+            citations = [
+                Citation(
+                    source_doc=d.source_doc,
+                    page_number=d.page_number,
+                    text=d.text[:200],
+                    chunk_id=d.chunk_id,
+                )
                 for d in docs
             ]
+            state["citations"] = citations
         except Exception as exc:  # noqa: BLE001
-            state["error_message"] = f"Generation failed: {exc}"
-            state["answer"] = (
-                "I encountered an error while generating the answer. "
-                "Please try again or rephrase your question."
+            state["node_errors"]["generation"] = str(exc)
+            state["answer_draft"] = (
+                "I encountered an error generating the answer. Please try again."
             )
         return state
 
 
 # ---------------------------------------------------------------------------
-# Conditional Edge Functions
+# Node: Answer Verification
 # ---------------------------------------------------------------------------
 
-def route_after_semantic_router(state: GraphState) -> str:
+class VerificationNode:
     """
-    Conditional edge: decide next node after semantic router.
+    Verifies the generated answer against retrieved evidence.
 
-    Returns
-    -------
-    "direct_generation"  if Route.SIMPLE
-    "slow_retrieval"     if Route.COMPLEX_SLOW
-    "task_decomposition"  if Route.COMPLEX_FAST
+    Runs:
+    1. Citation backtracking — ensure all inlined citations are real
+    2. Missing data alert — detect if answer references absent data
+    3. Sets answer_final = answer_draft if verified, else flags issues
     """
-    route = state.get("route")
-    if route == Route.SIMPLE:
-        return "direct_generation"
-    elif route == Route.COMPLEX_SLOW:
-        return "slow_retrieval"
-    return "task_decomposition"
+
+    def __init__(self, verification_tools: Optional[dict[str, callable]] = None) -> None:
+        self.verification_tools = verification_tools or {}
+
+    def run(self, state: GraphState) -> GraphState:
+        answer = state.get("answer_draft", "")
+        docs = state.get("slow_reranked_docs", []) or state.get("fast_reranked_docs", [])
+        question = state["question"]
+
+        if not answer or not docs:
+            state["answer_final"] = answer
+            return state
+
+        # Citation backtracking
+        citation_tool = self.verification_tools.get("verification_citation_backtrack")
+        if citation_tool:
+            evidence_chunks = [
+                {"text": d.text, "source_doc": d.source_doc, "page_number": d.page_number}
+                for d in docs
+            ]
+            try:
+                cit_result = citation_tool(answer=answer, evidence_chunks=evidence_chunks)
+                state["answer_groundedness_score"] = cit_result.get("num_valid", 0) / max(cit_result.get("num_citations_found", 1), 1)
+                if cit_result.get("num_issues", 0) > 0:
+                    state["fallback_triggered"] = FallbackReason.EVIDENCE_INSUFFICIENT
+            except Exception:  # noqa: BLE001
+                pass
+
+        state["answer_final"] = answer
+        return state
 
 
-def route_after_evidence_check(state: GraphState) -> str:
-    """
-    Conditional edge: fast path — route after evidence sufficiency check.
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
-    Loop logic:
-      - If NOT sufficient AND attempts < MAX_EVIDENCE_RETRIES → loop back to fast_retrieval
-      - Otherwise → MCP tool call (whether sufficient or circuit-broken)
-    """
-    sufficient = state.get("fast_evidence_sufficient", False)
-    attempts = state.get("fast_retrieval_attempts", 0)
-
-    if not sufficient and attempts < MAX_EVIDENCE_RETRIES:
-        return "fast_retrieval"  # Loop back
-    return "mcp_tool_call"
+def deduplicate(docs: list[RetrievedDoc]) -> list[RetrievedDoc]:
+    """Remove duplicate chunks by chunk_id, preserving order."""
+    seen: set[str] = set()
+    unique: list[RetrievedDoc] = []
+    for d in docs:
+        if d.chunk_id not in seen:
+            seen.add(d.chunk_id)
+            unique.append(d)
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -946,27 +821,19 @@ class FinancialRAGWorkflow:
     """
     LangGraph-based RAG workflow orchestrator.
 
-    Two complex paths + one simple path, all sharing the same entry point
-    and the same final generation node.
+    Three paths sharing the same entry point and the same final verification node.
 
     Parameters
     ----------
-    router : QwenRouter
-        Semantic router (Qwen3-0.6B).
-    generator : QwenGenerator
-        Answer generator (Qwen3-8B).
-    retriever : HybridRetriever
-        Hybrid retrieval engine (BGE-M3 + BM25 + RRRF).
-    reranker : BGEReranker
-        Cross-encoder reranker (BGE-Reranker v2).
-    judge_model : Any, optional
-        Lightweight LLM for evidence sufficiency check. Defaults to ``router``.
-    memory_manager : MemoryManager, optional
-        Conversation context manager.
-    mcp_tool_registry : dict[str, callable], optional
-        MCP tool registry (tool_name → callable).
-    session_id : str, optional
-        Session ID for conversation tracking.
+    router          : QwenRouter (Qwen3-0.6B)
+    generator       : QwenGenerator (Qwen3-8B)
+    retriever       : HybridRetriever (BGE-M3 + BM25 + RRRF)
+    reranker        : BGEReranker
+    judge_model     : Any, optional — LLM for evidence checking (default: router)
+    verification_tools : dict[str, callable], optional — MCP verification tool functions
+    memory_manager  : MemoryManager, optional
+    mcp_tool_registry : dict[str, callable], optional — MCP tool registry
+    session_id     : str, optional
     """
 
     def __init__(
@@ -976,8 +843,9 @@ class FinancialRAGWorkflow:
         retriever: Any,
         reranker: Any,
         judge_model: Optional[Any] = None,
+        verification_tools: Optional[dict[str, callable]] = None,
         memory_manager: Optional[Any] = None,
-        mcp_tool_registry: Optional[dict[str, Any]] = None,
+        mcp_tool_registry: Optional[dict[str, callable]] = None,
         session_id: Optional[str] = None,
     ) -> None:
         self.router = router
@@ -985,37 +853,37 @@ class FinancialRAGWorkflow:
         self.retriever = retriever
         self.reranker = reranker
         self.judge_model = judge_model or router
+        self.verification_tools = verification_tools or {}
         self.memory_manager = memory_manager
-        self.session_id = session_id or str(uuid.uuid4())
         self.mcp_tool_registry = mcp_tool_registry or {}
+        self.session_id = session_id or str(uuid.uuid4())
 
-        # Initialize all nodes
+        # Initialize nodes
         self._input = InputNode(session_id=self.session_id)
         self._semantic_router = SemanticRouterNode(router)
         self._direct_gen = DirectGenerationNode(generator, memory_manager)
-        self._task_decomposition = TaskDecompositionNode(generator)
-        self._retrieval_planning = RetrievalPlanningNode()
+        self._task_decomp = TaskDecompositionNode(generator)
+        self._retrieval_plan = RetrievalPlanningNode()
         self._slow_retrieval = SlowRetrievalNode(retriever)
         self._slow_rerank = SlowRerankNode(reranker)
         self._fast_retrieval = FastRetrievalNode(retriever)
         self._fast_rerank = FastRerankNode(reranker)
         self._evidence_check = EvidenceSufficiencyNode(self.judge_model)
         self._mcp_tool = MCPToolNode(self.mcp_tool_registry)
-        self._generation = GenerationNode(generator, memory_manager)
+        self._generation = GenerationNode(generator)
+        self._verification = VerificationNode(self.verification_tools)
 
-        # Build and compile graph
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:
-        """Assemble the LangGraph state machine."""
         g = StateGraph(GraphState)
 
-        # ── Nodes ──────────────────────────────────────────────────────────────
+        # ── Nodes ──────────────────────────────────────────────────────────
         g.add_node("input", lambda state: self._input.run(state["question"]))
         g.add_node("semantic_router", self._semantic_router.run)
         g.add_node("direct_generation", self._direct_gen.run)
-        g.add_node("task_decomposition", self._task_decomposition.run)
-        g.add_node("retrieval_planning", self._retrieval_planning.run)
+        g.add_node("task_decomposition", self._task_decomp.run)
+        g.add_node("retrieval_planning", self._retrieval_plan.run)
         g.add_node("slow_retrieval", self._slow_retrieval.run)
         g.add_node("slow_rerank", self._slow_rerank.run)
         g.add_node("fast_retrieval", self._fast_retrieval.run)
@@ -1023,14 +891,13 @@ class FinancialRAGWorkflow:
         g.add_node("evidence_check", self._evidence_check.run)
         g.add_node("mcp_tool_call", self._mcp_tool.run)
         g.add_node("generation", self._generation.run)
+        g.add_node("verification", self._verification.run)
 
-        # ── Entry ─────────────────────────────────────────────────────────────
+        # ── Entry ───────────────────────────────────────────────────────────
         g.set_entry_point("input")
-
-        # ── Input → Semantic Router ─────────────────────────────────────────
         g.add_edge("input", "semantic_router")
 
-        # ── Conditional: Semantic Router → (direct_gen | slow_retrieval | task_decomposition) ──
+        # ── Router → paths ─────────────────────────────────────────────────
         g.add_conditional_edges(
             "semantic_router",
             route_after_semantic_router,
@@ -1041,74 +908,45 @@ class FinancialRAGWorkflow:
             },
         )
 
-        # ── Simple path ───────────────────────────────────────────────────────
+        # ── Simple path ─────────────────────────────────────────────────────
         g.add_edge("direct_generation", END)
 
-        # ══════════════════════════════════════════════════════════════════════
-        # SLOW PATH:  retrieval → rerank → generation
-        # ══════════════════════════════════════════════════════════════════════
+        # ═══ SLOW PATH ════════════════════════════════════════════════════════
+        # retrieval → rerank → generation → verification → end
         g.add_edge("slow_retrieval", "slow_rerank")
         g.add_edge("slow_rerank", "generation")
-        g.add_edge("generation", END)
+        g.add_edge("generation", "verification")
+        g.add_edge("verification", END)
 
-        # ══════════════════════════════════════════════════════════════════════
-        # FAST PATH:  task_decomp → retrieval_plan → fast_retrieval
-        #            → fast_rerank → evidence_check
-        #            → [loop: fast_retrieval] | [mcp_tool_call]
-        #            → generation
-        # ══════════════════════════════════════════════════════════════════════
+        # ═══ FAST PATH ════════════════════════════════════════════════════════
+        # decomposition → planning → retrieval → rerank → evidence_check
+        # → [loop: retrieval | fallback: mcp_tool] → generation → verification → end
         g.add_edge("task_decomposition", "retrieval_planning")
         g.add_edge("retrieval_planning", "fast_retrieval")
         g.add_edge("fast_retrieval", "fast_rerank")
         g.add_edge("fast_rerank", "evidence_check")
 
-        # ── Conditional: evidence_check → (fast_retrieval loop | mcp_tool_call) ──
         g.add_conditional_edges(
             "evidence_check",
             route_after_evidence_check,
             {
                 "fast_retrieval": "fast_retrieval",  # Loop back
-                "mcp_tool_call": "mcp_tool_call",
+                "mcp_tool_call": "mcp_tool_call",    # Fallback to tools
             },
         )
 
-        # ── MCP tool call → generation ────────────────────────────────────────
         g.add_edge("mcp_tool_call", "generation")
 
         return g.compile()
 
     def run(self, question: str) -> dict[str, Any]:
-        """
-        Execute the full RAG pipeline for a question.
-
-        Parameters
-        ----------
-        question : str
-
-        Returns
-        -------
-        dict with keys: question, route, answer, citations, sub_tasks,
-                        slow/fast_retrieved_docs, tool_calls, error_message
-        """
+        """Execute the full pipeline for a question."""
         initial_state = self._input.run(question)
         final_state = self.graph.invoke(initial_state)
 
-        # Update memory
         if self.memory_manager is not None:
             self.memory_manager.add_turn("user", question)
-            if final_state.get("answer"):
-                self.memory_manager.add_turn("assistant", final_state["answer"])
+            if final_state.get("answer_final"):
+                self.memory_manager.add_turn("assistant", final_state["answer_final"])
 
         return dict(final_state)
-
-    def run_with_history(
-        self,
-        question: str,
-        conversation_history: list[dict[str, str]],
-    ) -> dict[str, Any]:
-        """
-        Execute the pipeline with explicit conversation history.
-        """
-        initial_state = self._input.run(question)
-        initial_state["conversation_history"] = conversation_history
-        return self.graph.invoke(initial_state)
